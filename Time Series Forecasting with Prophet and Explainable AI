@@ -1,0 +1,149 @@
+# =========================
+# IMPORT LIBRARIES
+# =========================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from prophet import Prophet
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+from statsmodels.tsa.arima.model import ARIMA
+
+import shap
+import warnings
+warnings.filterwarnings("ignore")
+
+sns.set_style("whitegrid")      
+
+# =========================
+# DATA GENERATION
+# =========================
+np.random.seed(42)
+
+dates = pd.date_range(start="2019-01-01", end="2023-12-31", freq="D")
+n = len(dates)
+
+trend = np.linspace(50, 120, n)
+seasonality = 15 * np.sin(2 * np.pi * dates.dayofyear / 365)
+weekly = 5 * np.sin(2 * np.pi * dates.dayofweek / 7)
+noise = np.random.normal(0, 5, n)
+
+temperature = 25 + 10 * np.sin(2 * np.pi * dates.dayofyear / 365) + np.random.normal(0, 2, n)
+holiday_effect = np.where(dates.month.isin([1, 12]), 10, 0)
+
+y = trend + seasonality + weekly + holiday_effect + noise
+
+df = pd.DataFrame({
+    "ds": dates,
+    "y": y,
+    "temperature": temperature,
+    "holiday": holiday_effect
+})
+
+df.head()
+
+# =========================
+# TRAIN TEST SPLIT
+# =========================
+train_size = int(len(df) * 0.8)
+train_df = df.iloc[:train_size]
+test_df = df.iloc[train_size:]
+
+# =========================
+# PROPHET MODEL SETUP
+# =========================
+model = Prophet(
+    yearly_seasonality=True,
+    weekly_seasonality=True,
+    daily_seasonality=False,
+    seasonality_mode="additive",
+    changepoint_prior_scale=0.1,
+    interval_width=0.95
+)
+
+model.add_regressor("temperature")
+model.add_regressor("holiday")
+
+model.fit(train_df)
+
+# =========================
+# TIME SERIES CROSS VALIDATION
+# =========================
+tscv = TimeSeriesSplit(n_splits=3)
+mae_scores = []
+
+for train_idx, val_idx in tscv.split(train_df):
+    cv_train = train_df.iloc[train_idx]
+    cv_val = train_df.iloc[val_idx]
+
+    cv_model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        changepoint_prior_scale=0.1
+    )
+    cv_model.add_regressor("temperature")
+    cv_model.add_regressor("holiday")
+
+    cv_model.fit(cv_train)
+    forecast = cv_model.predict(cv_val)
+
+    mae = mean_absolute_error(cv_val["y"], forecast["yhat"])
+    mae_scores.append(mae)
+
+print("Cross-Validation MAE:", np.mean(mae_scores))
+
+# =========================
+# FUTURE FORECAST
+# =========================
+future = model.make_future_dataframe(periods=len(test_df))
+future["temperature"] = df["temperature"].values
+future["holiday"] = df["holiday"].values
+
+forecast = model.predict(future)
+# =========================
+# FORECAST PLOT
+# =========================
+model.plot(forecast)
+plt.title("Prophet Forecast with 95% Confidence Interval")
+plt.show()
+
+model.plot_components(forecast)
+plt.show()
+forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail()
+
+# =========================
+# BASELINE ARIMA MODEL
+# =========================
+arima_model = ARIMA(train_df["y"], order=(5,1,0))
+arima_result = arima_model.fit()
+
+arima_forecast = arima_result.forecast(steps=len(test_df))
+
+arima_mae = mean_absolute_error(test_df["y"], arima_forecast)
+prophet_mae = mean_absolute_error(test_df["y"], forecast.iloc[train_size:]["yhat"])
+
+print("ARIMA MAE:", arima_mae)
+print("Prophet MAE:", prophet_mae)
+
+# =========================
+# SHAP EXPLAINABILITY
+# =========================
+explainer = shap.Explainer(
+    lambda x: model.predict(pd.DataFrame({
+        "ds": train_df["ds"].values,
+        "temperature": x[:, 0],
+        "holiday": x[:, 1]
+    }))["yhat"],
+    train_df[["temperature", "holiday"]].values
+)
+
+shap_values = explainer(train_df[["temperature", "holiday"]].values)
+
+shap.summary_plot(
+    shap_values,
+    features=train_df[["temperature", "holiday"]],
+    feature_names=["temperature", "holiday"]
+)
